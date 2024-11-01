@@ -3,9 +3,7 @@ import { toBlobURL, fetchFile } from "@ffmpeg/util";
 import "./style.css";
 
 const canvas = document.getElementById("glCanvas");
-const waveformCanvas = document.getElementById("waveform");
 const gl = canvas.getContext("webgl");
-const waveformCtx = waveformCanvas.getContext("2d");
 const playButton = document.getElementById("playButton");
 
 let audioContext;
@@ -21,96 +19,135 @@ let recordedChunks = [];
 let isExporting = false;
 
 async function setupRecorder() {
-    const stream = canvas.captureStream(30);
-    mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'video/webm;codecs=h264',
-        videoBitsPerSecond: 5000000
-    });
+  const getSupportedMimeType = () => {
+    const types = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm;codecs=h264,opus',
+      'video/webm'
+    ];
+    return types.find(type => MediaRecorder.isTypeSupported(type));
+  };
 
-    mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-            recordedChunks.push(event.data);
-        }
-    };
+  const mimeType = getSupportedMimeType();
+  if (!mimeType) {
+    throw new Error('No supported video MIME type found');
+  }
 
-    mediaRecorder.onstop = async () => {
-        exportButton.textContent = 'Converting...';
-        
-        const blob = new Blob(recordedChunks, { type: 'video/webm' });
-        
-        try {
-            // Initialize FFmpeg
-            const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.4/dist/umd';
-            const ffmpeg = new FFmpeg();
-            
-            await ffmpeg.load({
-                coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-                wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-                workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
-            });
+  // Create a composite stream of both canvas and audio
+  const canvasStream = canvas.captureStream(60);
+  const audioDestination = audioContext.createMediaStreamDestination();
+  analyser.connect(audioDestination);
 
-            // Log FFmpeg version to verify initialization
-            await ffmpeg.exec(['-version']);
-            console.log('FFmpeg loaded successfully');
+  // Combine the streams
+  const tracks = [
+    ...canvasStream.getVideoTracks(),
+    ...audioDestination.stream.getAudioTracks()
+  ];
+  const combinedStream = new MediaStream(tracks);
 
-            // Convert blob to buffer
-            const buffer = await blob.arrayBuffer();
-            const uint8Array = new Uint8Array(buffer);
+  mediaRecorder = new MediaRecorder(combinedStream, {
+    mimeType: mimeType,
+    videoBitsPerSecond: 5000000
+  });
 
-            try {
-                // Write input file
-                await ffmpeg.writeFile('input.webm', uint8Array);
-                console.log('Input file written successfully');
+  let startTime = 0;
+  mediaRecorder.ondataavailable = (event) => {
+    if (event.data && event.data.size > 0) {
+      recordedChunks.push(event.data);
+      console.log(`Chunk size: ${event.data.size} bytes`);
+    }
+  };
 
-                // Run conversion
-                await ffmpeg.exec([
-                    '-i', 'input.webm',
-                    '-c:v', 'libx264',  // Changed to libx264 for better compatibility
-                    '-preset', 'fast',
-                    '-crf', '22',
-                    'output.mp4'
-                ]);
-                console.log('Conversion completed');
+  mediaRecorder.onstart = () => {
+    startTime = Date.now();
+    console.log('Recording started');
+  };
 
-                // Read the output
-                const outputData = await ffmpeg.readFile('output.mp4');
-                console.log('Output file read successfully');
+  mediaRecorder.onstop = async () => {
+    const duration = Date.now() - startTime;
+    console.log(`Recording duration: ${duration}ms`);
+    exportButton.textContent = 'Converting...';
 
-                // Create download
-                const mp4Blob = new Blob([outputData], { type: 'video/mp4' });
-                const url = URL.createObjectURL(mp4Blob);
-                
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'visualization.mp4';
-                a.click();
-                
-                URL.revokeObjectURL(url);
+    await new Promise(resolve => setTimeout(resolve, 100));
 
-            } catch (error) {
-                console.error('FFmpeg operation failed:', error);
-                throw error;
-            } finally {
-                // Cleanup
-                try {
-                    await ffmpeg.deleteFile('input.webm');
-                    await ffmpeg.deleteFile('output.mp4');
-                } catch (e) {
-                    console.warn('Cleanup failed:', e);
-                }
-                await ffmpeg.terminate();
-            }
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    console.log(`Total recorded size: ${blob.size} bytes`);
 
-        } catch (error) {
-            console.error('Export failed:', error);
-            alert('Export failed. Please try again. Error: ' + error.message);
-        }
-        
-        recordedChunks = [];
-        exportButton.textContent = 'Export MP4';
-        exportButton.disabled = false;
-        isExporting = false;
-    };
+    if (blob.size < 1000) {
+      throw new Error('Recording too small, likely failed');
+    }
+
+    try {
+      const baseURL = 'https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/esm';
+      const ffmpeg = new FFmpeg();
+
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+        workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript"),
+      });
+
+      ffmpeg.on('log', console.log);
+      ffmpeg.on('progress', ({ ratio }) => {
+        console.log(`Conversion progress: ${(ratio * 100).toFixed(2)}%`);
+        exportButton.textContent = `Converting: ${(ratio * 100).toFixed(0)}%`;
+      });
+
+      console.log('FFmpeg loaded successfully');
+      const buffer = await blob.arrayBuffer();
+      const uint8Array = new Uint8Array(buffer);
+
+      try {
+        await ffmpeg.writeFile('input.webm', uint8Array);
+        console.log('Input file written successfully');
+
+        // First probe the input file
+        await ffmpeg.exec(['-i', 'input.webm']);
+
+        // More robust FFmpeg conversion command with audio
+        await ffmpeg.exec([
+          '-i', 'input.webm',
+          '-c:v', 'libx264',
+          '-c:a', 'aac',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-b:a', '192k',
+          '-movflags', '+faststart',
+          '-pix_fmt', 'yuv420p',
+          '-y',
+          'output.mp4'
+        ]);
+
+        console.log('Conversion completed');
+        const outputData = await ffmpeg.readFile('output.mp4');
+        console.log('Output file read successfully');
+
+        const mp4Blob = new Blob([outputData], { type: 'video/mp4' });
+        const url = URL.createObjectURL(mp4Blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'visualization.mp4';
+        a.click();
+
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        console.error('FFmpeg operation failed:', error);
+        throw error;
+      } finally {
+        await cleanup(ffmpeg);
+      }
+    } catch (error) {
+      console.error('Export failed:', error);
+      alert('Export failed. Please try again. Error: ' + error.message);
+    }
+
+    recordedChunks = [];
+    exportButton.textContent = 'Export MP4';
+    exportButton.disabled = false;
+    isExporting = false;
+  };
 }
 
 function resizeCanvases() {
@@ -119,55 +156,94 @@ function resizeCanvases() {
 
   canvas.width = width;
   canvas.height = height;
-  waveformCanvas.width = width;
-  waveformCanvas.height = height; // Make waveform canvas same size as main canvas
 
   if (gl) {
     gl.viewport(0, 0, canvas.width, canvas.height);
   }
 }
 
-// Vertex shader
 const vsSource = `
-            attribute vec4 aVertexPosition;
-            attribute vec2 aTextureCoord;
-            varying vec2 vTextureCoord;
-            void main() {
-                gl_Position = aVertexPosition;
-                vTextureCoord = aTextureCoord;
-            }
-        `;
+attribute vec4 aVertexPosition;
+attribute vec2 aTextureCoord;
+varying vec2 vTextureCoord;
+void main() {
+  gl_Position = aVertexPosition;
+  vTextureCoord = aTextureCoord;
+}
+`;
 
 const fsSource = `
-    precision mediump float;
-    varying vec2 vTextureCoord;
-    uniform sampler2D uSampler;
-    uniform float uAudioData[64];
+precision mediump float;
+varying vec2 vTextureCoord;
+uniform sampler2D uSampler;
+uniform float uAudioData[64];
+
+float getWaveformY(float x) {
+    float centerY = 0.5;
+    float amplitude = 0.0;
     
-    void main() {
-        vec4 texColor = texture2D(uSampler, vTextureCoord);
-        
-        float audioInfluence = 0.0;
-        for(int i = 0; i < 64; i++) {
-            float index = float(i);
-            float ypos = index / 64.0;
-            // Use (1.0 - vTextureCoord.y) to flip the calculation
-            float influence = uAudioData[i] * 0.3 * 
-                (1.0 - smoothstep(0.0, 0.1, abs(ypos - (1.0 - vTextureCoord.y))));
-            audioInfluence += influence;
-        }
-        
-        vec2 distortedCoord = vTextureCoord;
-        float wave = sin(vTextureCoord.x * 30.0 + audioInfluence * 5.0) * 0.005;
-        // Subtract the wave instead of adding it
-        distortedCoord.y -= wave * audioInfluence;
-        
-        vec4 finalColor = texture2D(uSampler, distortedCoord);
-        float glow = audioInfluence * 0.5;
-        finalColor.rgb += vec3(0.2, 0.4, 1.0) * glow;
-        
-        gl_FragColor = finalColor;
+    // Calculate wave amplitude based on audio data
+    for(int i = 0; i < 64; i++) {
+        float index = float(i);
+        float verticalFactor = 1.0 - abs(x - 0.5) * 2.0;
+        // Further reduced amplitude
+        float audioInfluence = uAudioData[i] * 0.015 * verticalFactor;
+        amplitude += audioInfluence;
     }
+    
+    return centerY + amplitude * sin(x * 30.0);
+}
+
+void main() {
+    vec4 texColor = texture2D(uSampler, vTextureCoord);
+    
+    // Original gradient effect logic
+    float audioInfluence = 0.0;
+    for(int i = 0; i < 64; i++) {
+        float index = float(i);
+        float ypos = index / 64.0;
+        float influence = uAudioData[i] * 0.3 * 
+            (1.0 - smoothstep(0.0, 0.1, abs(ypos - (1.0 - vTextureCoord.y))));
+        audioInfluence += influence;
+    }
+    
+    vec2 distortedCoord = vTextureCoord;
+    float wave = sin(vTextureCoord.x * 30.0 + audioInfluence * 5.0) * 0.005;
+    distortedCoord.y -= wave * audioInfluence;
+    
+    vec4 finalColor = texture2D(uSampler, distortedCoord);
+    float glow = audioInfluence * 0.5;
+    finalColor.rgb += vec3(0.2, 0.4, 1.0) * glow;
+    
+    // Add waveform line with consistent thickness
+    float waveY = getWaveformY(vTextureCoord.x);
+    
+    // Calculate distance from center of screen (horizontally)
+    float distFromCenter = abs(vTextureCoord.x - 0.5);
+    
+    // Make line much thicker in the center
+    float baseLineWidth = 0.003;
+    float centerThicknessMultiplier = 4.0; // Increased center thickness
+    float lineWidth = baseLineWidth * (1.0 + (1.0 - pow(distFromCenter, 0.5)) * centerThicknessMultiplier);
+    
+    // Calculate vertical distance to line, normalized by line width
+    float distToLine = abs(vTextureCoord.y - waveY) / lineWidth;
+    
+    // Create consistent line thickness
+    float lineStrength = smoothstep(1.0, 0.0, distToLine);
+    
+    // Add glow effect to the line
+    float baseGlowWidth = 0.012;
+    float glowWidth = baseGlowWidth * (1.0 + (1.0 - pow(distFromCenter, 0.5)) * 2.0);
+    float glowStrength = smoothstep(1.0, 0.0, abs(vTextureCoord.y - waveY) / glowWidth) * 0.5;
+    
+    // Combine line and glow with original effect
+    vec3 lineColor = vec3(0.2, 0.6, 0.85); // Light blue color
+    finalColor.rgb = mix(finalColor.rgb, lineColor, lineStrength);
+    finalColor.rgb += lineColor * glowStrength;
+    
+    gl_FragColor = finalColor;
+}
 `;
 
 function initShaderProgram(gl, vsSource, fsSource) {
@@ -269,90 +345,6 @@ function loadImage(file) {
   img.src = URL.createObjectURL(file);
 }
 
-function drawWaveform(dataArray) {
-  waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
-
-  const width = waveformCanvas.width;
-  const height = waveformCanvas.height;
-  const centerX = width / 2;
-  const centerY = height / 2;
-
-  // Create vertical gradient
-  const gradient = waveformCtx.createLinearGradient(0, 0, 0, height);
-  gradient.addColorStop(0, "rgba(52, 152, 219, 0.8)"); // Bottom (more opaque)
-  gradient.addColorStop(0.5, "rgba(52, 152, 219, 0.4)"); // Middle (semi-transparent)
-  gradient.addColorStop(1, "rgba(52, 152, 219, 0)"); // Top (transparent)
-
-  // Calculate number of vertical sections
-  const numSections = 40;
-  const sectionHeight = height / numSections;
-
-  // Create vertical wave paths
-  waveformCtx.beginPath();
-  waveformCtx.moveTo(width, centerY);
-
-  // Left side of the wave
-  const leftPoints = [];
-  const rightPoints = [];
-
-  for (let i = numSections; i >= 0; i--) {
-    const x = i * sectionHeight;
-
-    const dataIndex = Math.floor((i / numSections) * dataArray.length);
-    const audioValue = dataArray[dataIndex] / 255.0;
-
-    const verticalFactor = 1 - Math.abs(x / width - 0.5) * 2;
-    const amplitude = width * 0.25 * audioValue * verticalFactor;
-
-    const leftY = centerY - amplitude;
-    const rightY = centerY + amplitude;
-
-    leftPoints.push({ x: x, y: leftY });
-    rightPoints.unshift({ x: x, y: rightY });
-  }
-
-  waveformCtx.moveTo(width, centerY);
-  leftPoints.forEach((point, index) => {
-    if (index === 0) {
-      waveformCtx.lineTo(point.x, point.y);
-    } else {
-      const xc = (leftPoints[index - 1].x + point.x) / 2;
-      const yc = (leftPoints[index - 1].y + point.y) / 2;
-      waveformCtx.quadraticCurveTo(
-        leftPoints[index - 1].x,
-        leftPoints[index - 1].y,
-        xc,
-        yc
-      );
-    }
-  });
-
-  rightPoints.forEach((point, index) => {
-    if (index === 0) {
-      waveformCtx.lineTo(point.x, point.y);
-    } else {
-      const xc = (rightPoints[index - 1].x + point.x) / 2;
-      const yc = (rightPoints[index - 1].y + point.y) / 2;
-      waveformCtx.quadraticCurveTo(
-        rightPoints[index - 1].x,
-        rightPoints[index - 1].y,
-        xc,
-        yc
-      );
-    }
-  });
-
-  waveformCtx.lineTo(width, centerY);
-
-  waveformCtx.fillStyle = gradient;
-  waveformCtx.fill();
-
-  waveformCtx.strokeStyle = "rgba(52, 152, 219, 0.5)";
-  waveformCtx.lineWidth = 2;
-  waveformCtx.shadowColor = "rgba(52, 152, 219, 0.5)";
-  waveformCtx.shadowBlur = 15;
-  waveformCtx.stroke();
-}
 
 async function setupAudioContext() {
   if (!audioContext) {
@@ -375,7 +367,7 @@ async function loadAudioFile(file) {
     });
 
     audioBuffer = await audioContext.decodeAudioData(audioData);
-    exportButton.disabled = false; // Enable export when audio is loaded
+    exportButton.disabled = false;
   } catch (error) {
     console.error("Error loading audio file:", error);
     alert("Error loading audio file. Please try another file.");
@@ -409,8 +401,6 @@ function draw() {
   const dataArray = new Uint8Array(analyser.frequencyBinCount);
   analyser.getByteFrequencyData(dataArray);
 
-  drawWaveform(dataArray);
-
   const normalizedData = Array.from(dataArray).map((value) => value / 255.0);
 
   gl.uniform1fv(programInfo.uniformLocations.uAudioData, normalizedData);
@@ -423,7 +413,6 @@ function draw() {
   requestAnimationFrame(draw);
 }
 
-// Event Listeners
 document.getElementById("audioInput").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (file) {
@@ -454,52 +443,69 @@ playButton.addEventListener("click", () => {
   }
 });
 
-// Initial setup
 resizeCanvases();
 const programInfo = initGL();
 gl.clearColor(0.0, 0.0, 0.0, 1.0);
 gl.clear(gl.COLOR_BUFFER_BIT);
 
+async function cleanup(ffmpeg) {
+  try {
+    await ffmpeg.deleteFile('input.webm');
+    await ffmpeg.deleteFile('output.mp4');
+  } catch (e) {
+    console.warn('Cleanup failed:', e);
+  }
+  await ffmpeg.terminate();
+}
+
 async function exportVideo() {
-    if (isExporting) return;
-    
-    try {
-        isExporting = true;
-        exportButton.disabled = true;
-        exportButton.textContent = 'Recording...';
-        
-        if (!mediaRecorder) {
-            await setupRecorder();
-        }
-        
-        recordedChunks = [];
-        mediaRecorder.start(1000); // Record in 1-second chunks
-        
-        // Create new audio source for export
-        const exportSource = audioContext.createBufferSource();
-        exportSource.buffer = audioBuffer;
-        exportSource.connect(analyser);
-        analyser.connect(audioContext.destination);
-        
-        // Start playback
-        exportSource.start();
-        draw();
-        
-        // Stop recording when audio ends
-        exportSource.onended = () => {
-            if (mediaRecorder.state === 'recording') {
-                mediaRecorder.stop();
-            }
-            isPlaying = false;
-        };
-        
-    } catch (error) {
-        console.error('Export setup failed:', error);
-        alert('Export setup failed. Please try again. Error: ' + error.message);
-        exportButton.textContent = 'Export MP4';
-        exportButton.disabled = false;
-        isExporting = false;
+  if (isExporting || !audioBuffer) return;
+
+  try {
+    isExporting = true;
+    exportButton.disabled = true;
+    exportButton.textContent = 'Recording...';
+
+    if (!mediaRecorder) {
+      await setupRecorder();
     }
+
+    recordedChunks = [];
+
+    // Start recording with smaller timeslice for more frequent chunks
+    mediaRecorder.start(500);
+
+    const exportSource = audioContext.createBufferSource();
+    exportSource.buffer = audioBuffer;
+    exportSource.connect(analyser);
+
+    // Don't connect to audioContext.destination as we're using mediaStreamDestination
+    // analyser.connect(audioContext.destination);
+
+    const cleanup = () => {
+      if (mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+      }
+      isPlaying = false;
+    };
+
+    exportSource.onended = cleanup;
+    exportSource.onerror = (error) => {
+      console.error('Audio playback error:', error);
+      cleanup();
+    };
+
+    isPlaying = true;
+    exportSource.start();
+    draw();
+
+  } catch (error) {
+    console.error('Export setup failed:', error);
+    alert('Export setup failed. Please try again. Error: ' + error.message);
+    exportButton.textContent = 'Export MP4';
+    exportButton.disabled = false;
+    isExporting = false;
+  }
 }
 
 exportButton.addEventListener("click", exportVideo);
